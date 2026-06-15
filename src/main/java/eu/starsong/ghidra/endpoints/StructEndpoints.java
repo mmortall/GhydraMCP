@@ -11,7 +11,6 @@ import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.Program;
 import ghidra.util.Msg;
-import ghidra.util.exception.DuplicateNameException;
 
 import java.io.IOException;
 import java.net.URLDecoder;
@@ -704,7 +703,7 @@ public class StructEndpoints extends AbstractEndpoint {
                         if (hasNameUpdate && !Objects.equals(updatedName, originalName)) {
                             try {
                                 updatedComponent.setFieldName(updatedName);
-                            } catch (DuplicateNameException e) {
+                            } catch (Exception e) {
                                 throw new Exception("Field name already exists in struct: " + updatedName, e);
                             }
                         }
