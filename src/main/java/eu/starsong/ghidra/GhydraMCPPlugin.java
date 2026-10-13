@@ -63,8 +63,10 @@ public class GhydraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     public GhydraMCPPlugin(PluginTool tool) {
         super(tool);
         
-        this.port = findAvailablePort();
-        activeInstances.put(port, this);
+        synchronized (activeInstances) {
+            this.port = findAvailablePort();
+            activeInstances.put(port, this);
+        }
         
         synchronized (baseInstanceLock) {
             if (port == ApiConstants.DEFAULT_PORT || activeInstances.get(ApiConstants.DEFAULT_PORT) == null) {
@@ -433,6 +435,26 @@ public class GhydraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      * @return An available port number
      */
     private int findAvailablePort() {
+        String configuredPort = System.getProperty("ghidra.mcp.port");
+        if (configuredPort != null) {
+            final int requestedPort;
+            try {
+                requestedPort = Integer.parseInt(configuredPort.trim());
+            } catch (NumberFormatException error) {
+                throw new IllegalArgumentException("Invalid ghidra.mcp.port: " + configuredPort, error);
+            }
+            if (requestedPort < 1 || requestedPort > 65535) {
+                throw new IllegalArgumentException("ghidra.mcp.port must be between 1 and 65535");
+            }
+            if (activeInstances.containsKey(requestedPort)) {
+                throw new IllegalStateException("ghidra.mcp.port is unavailable: " + requestedPort);
+            }
+            try (ServerSocket socket = new ServerSocket(requestedPort)) {
+                return requestedPort;
+            } catch (IOException error) {
+                throw new IllegalStateException("ghidra.mcp.port is unavailable: " + requestedPort, error);
+            }
+        }
         int basePort = ApiConstants.DEFAULT_PORT;
         int maxAttempts = ApiConstants.MAX_PORT_ATTEMPTS;
         

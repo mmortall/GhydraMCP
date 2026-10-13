@@ -7,6 +7,8 @@ import com.sun.net.httpserver.HttpServer;
 import eu.starsong.ghidra.api.ResponseBuilder;
 import eu.starsong.ghidra.util.GhidraSwing;
 import eu.starsong.ghidra.util.TransactionHelper;
+import ghidra.app.util.PseudoDisassembler;
+import ghidra.app.util.PseudoInstruction;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
@@ -22,6 +24,8 @@ import java.util.*;
 
 public class MemoryEndpoints extends AbstractEndpoint {
 
+    private static final int DEFAULT_DISASSEMBLY_COUNT = 50;
+    private static final int MAX_DISASSEMBLY_SCAN = 256;
     private static final int DEFAULT_MEMORY_LENGTH = 16;
     private static final int MAX_MEMORY_LENGTH = 1048576;
     private PluginTool tool;
@@ -375,116 +379,120 @@ private CommentType getCommentType(String commentType) {
     }
 }
 
-private void handleDisassemblyAtAddress(HttpExchange exchange, String addressStr) throws IOException {
+private static int parseDisassemblyInteger(String value, int fallback) {
+        return value == null ? fallback : Integer.parseInt(value.trim());
+    }
+
+    private void handleDisassemblyAtAddress(HttpExchange exchange, String addressStr) throws IOException {
         try {
             if (!"GET".equals(exchange.getRequestMethod())) {
                 sendErrorResponse(exchange, 405, "Method Not Allowed");
                 return;
             }
-
             Program program = getCurrentProgram();
             if (program == null) {
                 sendErrorResponse(exchange, 400, "No program loaded", "NO_PROGRAM_LOADED");
                 return;
             }
-
             Map<String, String> params = parseQueryParams(exchange);
             String limitStr = params.get("limit") != null ? params.get("limit") : params.get("count");
-            int count = parseIntOrDefault(limitStr, 50);
-            int offset = parseIntOrDefault(params.get("offset"), 0);
-
-            Address startAddr;
-            startAddr = resolveAddress(program, addressStr, true);
-            if (startAddr == null) {
-                sendErrorResponse(exchange, 400, "Invalid address format: " + addressStr, "INVALID_ADDRESS");
+            final int count;
+            final int offset;
+            try {
+                count = parseDisassemblyInteger(limitStr, DEFAULT_DISASSEMBLY_COUNT);
+                offset = parseDisassemblyInteger(params.get("offset"), 0);
+            } catch (NumberFormatException error) {
+                sendErrorResponse(exchange, 400, "Count and offset must be integers", "INVALID_RANGE");
                 return;
             }
-
+            if (count <= 0 || offset < 0) {
+                sendErrorResponse(exchange, 400,
+                    "Count must be positive and offset must be non-negative", "INVALID_RANGE");
+                return;
+            }
+            if ((long) count + offset > MAX_DISASSEMBLY_SCAN) {
+                sendErrorResponse(exchange, 400,
+                    "Count plus offset exceeds maximum disassembly scan", "INVALID_RANGE");
+                return;
+            }
+            Address startAddr = resolveAddress(program, addressStr, true);
             if (startAddr == null) {
                 sendErrorResponse(exchange, 400, "Invalid address: " + addressStr, "INVALID_ADDRESS");
                 return;
             }
-
             final Program prog = program;
-            final Address startAddrFinal = startAddr;
-            final int countFinal = count;
-            final int offsetFinal = offset;
+            final Address[] nextAddress = new Address[] {startAddr};
+            final boolean[] decodeComplete = new boolean[] {true};
+            final String[] decodeError = new String[] {null};
             final List<Map<String, Object>> allInstructions = new ArrayList<>();
-            final boolean[] anyInstructions = new boolean[1];
-
             GhidraSwing.runRead(() -> {
-                ghidra.program.model.listing.Listing listing = prog.getListing();
-                Memory mem = prog.getMemory();
-                ghidra.program.model.listing.InstructionIterator instrIter =
-                    listing.getInstructions(startAddrFinal, true);
-
-                int totalScanned = 0;
-
-                while (instrIter.hasNext() && totalScanned < offsetFinal + countFinal) {
-                    ghidra.program.model.listing.Instruction instr = instrIter.next();
-                    totalScanned++;
-
-                    if (totalScanned <= offsetFinal) {
-                        continue;
-                    }
-
-                    Map<String, Object> instrMap = new HashMap<>();
-                    instrMap.put("address", instr.getAddress().toString());
-
+                PseudoDisassembler disassembler = new PseudoDisassembler(prog);
+                disassembler.setRespectExecuteFlag(false);
+                Memory memory = prog.getMemory();
+                Address instructionAddress = startAddr;
+                for (int scanned = 0; scanned < offset + count; scanned++) {
+                    nextAddress[0] = instructionAddress;
                     try {
-                        byte[] bytes = new byte[instr.getLength()];
-                        mem.getBytes(instr.getAddress(), bytes);
-                        StringBuilder hexBytes = new StringBuilder();
-                        for (byte b : bytes) {
-                            hexBytes.append(String.format("%02X", b & 0xFF));
+                        PseudoInstruction instr = disassembler.disassemble(instructionAddress);
+                        if (instr == null) {
+                            decodeComplete[0] = false;
+                            decodeError[0] = "No instruction decoded at " + instructionAddress;
+                            break;
                         }
-                        instrMap.put("bytes", hexBytes.toString());
-                    } catch (MemoryAccessException e) {
-                        instrMap.put("bytes", "??");
+                        int parsedLength = instr.getParsedLength();
+                        if (parsedLength <= 0) {
+                            decodeComplete[0] = false;
+                            decodeError[0] = "Invalid instruction length at " + instructionAddress;
+                            break;
+                        }
+                        byte[] bytes = new byte[parsedLength];
+                        if (memory.getBytes(instructionAddress, bytes) != parsedLength) {
+                            throw new IOException("Incomplete instruction bytes at " + instructionAddress);
+                        }
+                        if (scanned >= offset) {
+                            StringBuilder hexBytes = new StringBuilder();
+                            for (byte value : bytes) {
+                                hexBytes.append(String.format("%02X", value & 0xFF));
+                            }
+                            Map<String, Object> row = new HashMap<>();
+                            row.put("address", instructionAddress.toString());
+                            row.put("bytes", hexBytes.toString());
+                            row.put("mnemonic", instr.getMnemonicString());
+                            row.put("operands", instr.toString().substring(instr.getMnemonicString().length()).trim());
+                            allInstructions.add(row);
+                        }
+                        instructionAddress = instructionAddress.add(parsedLength);
+                        nextAddress[0] = instructionAddress;
+                    } catch (Exception error) {
+                        decodeComplete[0] = false;
+                        decodeError[0] = "Decode failed at " + instructionAddress + ": " + error.getMessage();
+                        break;
                     }
-
-                    instrMap.put("mnemonic", instr.getMnemonicString());
-                    instrMap.put("operands", instr.toString().substring(instr.getMnemonicString().length()).trim());
-                    allInstructions.add(instrMap);
-                }
-
-                if (allInstructions.isEmpty()) {
-                    // Check if there is an instruction anywhere else in the program to see if analysis was run
-                    anyInstructions[0] = prog.getListing().getInstructions(true).hasNext();
                 }
                 return null;
             });
-
             Map<String, Object> result = new HashMap<>();
             result.put("startAddress", addressStr);
             result.put("instructions", allInstructions);
             result.put("totalInstructions", allInstructions.size());
-
-            if (allInstructions.isEmpty()) {
-                result.put("message", "No defined instructions found at or after " + addressStr +
-                    ". You may need to run analysis or manually disassemble this area.");
-
-                if (!anyInstructions[0]) {
-                    result.put("warning", "It appears no instructions are defined in the entire program. " +
-                        "Is analysis complete?");
-                }
+            result.put("disassemblyMode", "pseudo");
+            result.put("decodeComplete", decodeComplete[0]);
+            if (decodeError[0] != null) {
+                result.put("decodeError", decodeError[0]);
             }
-
+            String selfHref = "/memory/" + addressStr + "/disassembly?count=" + count;
+            if (offset != 0) {
+                selfHref += "&offset=" + offset;
+            }
             ResponseBuilder builder = new ResponseBuilder(exchange, port)
-                .success(true)
-                .result(result)
-                .addLink("self", "/memory/" + addressStr + "/disassembly?count=" + count);
-
-            if (!allInstructions.isEmpty()) {
-                String lastAddr = (String) allInstructions.get(allInstructions.size() - 1).get("address");
-                builder.addLink("next", "/memory/" + lastAddr + "/disassembly?count=" + count);
+                .success(true).result(result).addLink("self", selfHref);
+            if (!allInstructions.isEmpty() && decodeComplete[0]) {
+                builder.addLink("next", "/memory/" + nextAddress[0].toString() + "/disassembly?count=" + count);
             }
-
             sendJsonResponse(exchange, builder.build(), 200);
-
-        } catch (Exception e) {
-            Msg.error(this, "Error in disassembly at address endpoint", e);
-            sendErrorResponse(exchange, 500, "Internal server error: " + e.getMessage(), "INTERNAL_ERROR");
+        } catch (Exception error) {
+            Msg.error(this, "Error in disassembly at address endpoint", error);
+            sendErrorResponse(exchange, 500, "Internal server error: " + error.getMessage(), "INTERNAL_ERROR");
         }
     }
 
